@@ -244,6 +244,10 @@ LEVELRANGE_COLORS = {
 
     ON          = { r = 0.0, g = 1.0, b = 0.0 },
     OFF         = { r = 1.0, g = 0.0, b = 0.0 },
+
+    Difficult = { r = 1, g = 0.5, b = 0.25, },
+    Normal = { r = 1, g = 1, b = 0, },
+    Easy = { r = 0.12, g = 1, b = 0, },
 };
 
 -- Options
@@ -255,6 +259,160 @@ LevelRange = {
 --------------------------------------------------------------------------------------------------
 -- Map Drawing Functions
 --------------------------------------------------------------------------------------------------
+
+local quest_db = {}
+
+function quest_db.zone_ids(name)
+    local dict = pfDatabase:GetIDByName(name, "zones", true)
+
+    local count = 0
+    local ids = {}
+    for id in pairs(dict) do
+        if id and id ~= 0 then
+            ids[id] = true
+            count = count + 1
+        end
+    end
+    return count == 0 and nil or ids
+end
+
+function quest_db.zone_quests(zone_name)
+    local zone_ids = quest_db.zone_ids(zone_name)
+    
+    -- local str = zone_name
+    -- for id in pairs(zone_ids) do
+    --     str = str .. ", " .. id
+    -- end
+    -- print(str)
+
+    if not zone_ids then
+        return nil
+    end
+
+    local plevel = UnitLevel("player")
+    local _, race = UnitRace("player")
+    local prace = pfDatabase:GetBitByRace(race)
+    local _, class = UnitClass("player")
+    local pclass = pfDatabase:GetBitByClass(class)
+    local pfaction = UnitFactionGroup("player")
+    if pfaction == "Horde" then
+        pfaction = "H"
+    elseif pfaction == "Alliance" then
+        pfaction = "A"
+    else
+        pfaction = "GM"
+    end
+
+    local quests = pfDB["quests"]["data"]
+    local sum, count = quest_db.add_quests(quests, zone_ids, quest_id, plevel, pclass, prace, pfaction)
+    -- print(zone_name, sum, count)
+
+    local avg = sum / count
+    return count, avg
+end
+
+function quest_db.add_quests(quests, zone_ids, quest_id, plevel, pclass, prace, pfaction, sum, count)
+    local sum = sum or 0
+    local count = count or 0
+
+    for quest_id in pairs(quests) do
+        if quest_db.is_valid_quest(quests, zone_ids, quest_id, plevel, pclass, prace, pfaction) then
+            local qlevel = quest_db.get_level(quests, quest_id)
+            sum = sum + qlevel
+            count = count + 1
+        end
+    end
+    return sum, count
+end
+
+local ignore_quests = {
+    ["Arathi Basin Mark of Honor!"] = true,
+    ["Battle of Warsong Gulch"] = true,
+    ["Claiming Arathi Basin"] = true,
+    ["Conquering Arathi Basin"] = true,
+    ["Cut Arathor Supply Lines"] = true,
+    ["Fight for Warsong Gulch"] = true,
+    ["Mark of Honor"] = true,
+    ["More Resource Crates"] = true,
+    ["Quell the Silverwing Usurpers"] = true,
+    ["Ribbons of Sacrifice"] = true,
+    ["Talismans of Merit"] = true,
+    ["The Battle for Arathi Basin!"] = true,
+    ["Vanquish the Invaders!"] = true,
+}
+
+function quest_db.ignore_quest(quests, q_id)
+    local title = pfDB.quests.loc[q_id] and pfDB.quests.loc[q_id].T
+    if not title then
+        return true
+    end
+    if ignore_quests[title] then
+        return true
+    end
+    return false
+end
+
+function quest_db.is_valid_quest(quests, zone_ids, id, plevel, pclass, prace, pfaction)
+    -- ignore empty quests
+    if not quests[id]["lvl"] or not quests[id]["start"] then
+        -- if not quests[id][]
+        return false
+    end
+
+    if not pfDatabase:QuestFilter(id, plevel, pclass, prace) then
+        return false
+    end
+
+    if quest_db.ignore_quest(quests, id) then
+        return false
+    end
+
+    local qlevel = quest_db.get_level(quests, id)
+    if (plevel - qlevel > 5) or (qlevel - plevel > 4) then
+        return false
+    end
+
+    -- ignore blue quests
+    if quests[id]["event"] then
+        return false
+    end
+
+    -- ignore quests without a start unit / object
+    if not quests[id]["start"] then
+        return false
+    end
+
+    if quests[id]["start"]["U"] then
+        local units = pfDB["units"]["data"]
+        return quest_db.x_is_in_zone(quests, id, zone_ids, pfaction, units, "U")
+    end
+    if quests[id]["start"]["O"] then
+        local objects = pfDB["objects"]["data"]
+        return quest_db.x_is_in_zone(quests, id, zone_ids, pfaction, objects, "O")
+    end
+
+    return false
+end
+
+function quest_db.x_is_in_zone(quests, q_id, z_ids, pfaction, db, tag)
+    for _, id in pairs(quests[q_id]["start"][tag]) do
+        if db[id] and db[id]["coords"] and strfind(db[id]["fac"] or pfaction, pfaction) then
+            for _, data in pairs(db[id]["coords"]) do
+                local _, _, zone, _ = unpack(data)
+
+                if z_ids[zone] then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+function quest_db.get_level(quests, id)
+    return quests[id]["lvl"]
+end
 
 -- Update the tooltip for a zone
 local function lUpdateTooltip(zoneName)
@@ -304,18 +462,39 @@ local function lUpdateTooltip(zoneName)
         levels = string.format(LEVELRANGE_LEVELS, min, max);
     end
 
-    -- Determine fishing level Requirement
-    if (LEVELRANGE_FISHING[zoneName]) then
-        local fmin = LEVELRANGE_FISHING[zoneName][1];
-        flevel = string.format(LEVELRANGE_FLEVEL, fmin);
-    end
+    -- Generate the quest info string
+    local quest_string = nil
+    local quest_col = LEVELRANGE_COLORS.None
+    local count, level = quest_db.zone_quests(zoneName)
+    if count then
+        quest_string = string.format("%d quests, level %.1f", count, level)
 
+        local plevel = UnitLevel("player")
+        if math.abs(level - plevel) <= 2 then
+            quest_col = LEVELRANGE_COLORS.Normal
+        end
+        if plevel - level > 2 then
+            quest_col = LEVELRANGE_COLORS.Easy
+        end
+        if level - plevel > 2 then
+            quest_col = LEVELRANGE_COLORS.Difficult
+        end
+    end
+    if count == 0 then
+        quest_string = "No quests"
+    end
+    
     -- Start making the Tooltip
 
     -- Show the zone title and add level range if known
     LevelRangeTooltip:SetText(zoneName, normalcol.r, normalcol.g, normalcol.b);
     if levels then
         LevelRangeTooltip:AddLine(levels, levelscol.r, levelscol.g, levelscol.b);
+    end
+
+    -- Show the quest levels
+    if quest_string then
+        LevelRangeTooltip:AddLine(quest_string, quest_col.r, quest_col.g, quest_col.b)
     end
 
     -- Show fishing level requirement if desired
